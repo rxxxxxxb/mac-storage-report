@@ -39,6 +39,93 @@ subheader() {
   echo -e "  ${DIM}──────────────────────────────────────────────────────────${RESET}"
 }
 
+# ── Progress indicator ───────────────────────────────────────────────
+#
+# The disk walk below is the one slow step in the report — a minute or more on a
+# full Mac — and nothing can be printed until it finishes. Without a sign of
+# life that reads as a hang, so animate a spinner next to the two things `du`
+# tells us for free: how many directories it has indexed so far (lines in the
+# index file) and where it currently is (the last line).
+#
+# Only on a terminal. Redirected into a file or a pipe, the escape codes and the
+# redrawn line would be noise, so that path falls back to a plain notice.
+
+SPINNER_FRAMES=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+
+# Tracked so the cleanup trap can put the cursor back if the report is
+# interrupted mid-scan — a hidden cursor outlives the process that hid it.
+CURSOR_HIDDEN=0
+
+is_tty() { [ -t 1 ]; }
+
+hide_cursor() {
+  printf '\033[?25l'
+  CURSOR_HIDDEN=1
+}
+
+show_cursor() {
+  if [ "$CURSOR_HIDDEN" -eq 1 ]; then
+    printf '\033[?25h'
+    CURSOR_HIDDEN=0
+  fi
+}
+
+# Squeeze a path down to its last few components so it fits on the status line:
+# "…/Application Support/Google/Chrome"
+short_path() {
+  LC_ALL=C awk -v p="${1/#$HOME/~}" -v keep=3 'BEGIN {
+    n = split(p, part, "/")
+    if (n <= keep) { print p; exit }
+    out = ""
+    for (i = n - keep + 1; i <= n; i++) out = out "/" part[i]
+    print "…" out
+  }'
+}
+
+# Animate the spinner until PID $1 exits, leaving the last frame on screen for
+# the next step (or the summary line) to overwrite. Callers only reach this when
+# stdout is a terminal.
+scan_progress() {
+  local pid="$1" frame=0 tick=0 count=0 where="" elapsed width status room trail
+
+  width=$(tput cols 2>/dev/null) || width=80
+  case "$width" in '' | *[!0-9]*) width=80 ;; esac
+
+  hide_cursor
+  while kill -0 "$pid" 2>/dev/null; do
+    # Reading a file that grows to a few megabytes is cheap but not free, and
+    # the numbers don't need to change ten times a second — refresh them once
+    # per second and just spin in between.
+    if [ $((tick % 10)) -eq 0 ] && [ -s "$DU_CACHE_FILE" ]; then
+      count=$(wc -l <"$DU_CACHE_FILE" 2>/dev/null | tr -d ' ') || count=0
+      where=$(tail -n 1 "$DU_CACHE_FILE" 2>/dev/null | cut -f2-) || where=""
+      [ -z "$where" ] || where=$(short_path "$where")
+    fi
+    elapsed=$((SECONDS - SCAN_START))
+
+    # The same text that gets printed below, uncolored, to measure how much room
+    # is left for the path. Below ~12 columns there's nothing worth showing.
+    status="  ${SPINNER_FRAMES[$frame]} Scanning disk…  $count folders · ${elapsed}s  "
+    room=$((width - ${#status} - 1))
+    trail=""
+    if [ "$room" -ge 12 ]; then
+      trail="$where"
+      [ "${#trail}" -le "$room" ] || trail="${trail:0:$room}"
+    fi
+
+    # \r returns to the start of the line and \033[K wipes the rest of it, so a
+    # shorter path never leaves the tail of a longer one behind.
+    printf '\r\033[K  %b%s%b %bScanning disk…%b  %s folders · %ss  %b%s%b' \
+      "$CYAN" "${SPINNER_FRAMES[$frame]}" "$RESET" "$WHITE" "$RESET" \
+      "$count" "$elapsed" "$DIM" "$trail" "$RESET"
+
+    frame=$(((frame + 1) % ${#SPINNER_FRAMES[@]}))
+    tick=$((tick + 1))
+    sleep 0.1
+  done
+  wait "$pid" 2>/dev/null || true
+}
+
 # ── du cache ─────────────────────────────────────────────────────────
 #
 # Measuring a directory means walking every file under it, and this report asks
@@ -65,21 +152,69 @@ DU_CACHE_FILE=""
 # outside these roots, simply misses and falls back to du.
 CACHE_DEPTH=5
 
-# Removes only the temp index created below via mktemp. It never touches a path
-# being reported on — the report itself deletes nothing.
+# PID of the walk currently running, so the spinner can watch it and the cleanup
+# below can stop it if the report is interrupted mid-scan. SCAN_START anchors
+# the elapsed-time counter across both walks.
+SCAN_PID=""
+SCAN_START=0
+
+# Stops the walk and removes only the temp index created below via mktemp. It
+# never touches a path being reported on — the report itself deletes nothing.
 cache_cleanup() {
+  show_cursor
+  if [ -n "$SCAN_PID" ] && kill -0 "$SCAN_PID" 2>/dev/null; then
+    # Reaped here, with stderr closed, purely to swallow bash's "Terminated: 15
+    # du -kd 5 ..." job notice — noise to someone who just pressed Ctrl-C.
+    { kill "$SCAN_PID" && wait "$SCAN_PID"; } 2>/dev/null || true
+  fi
   if [ -n "$DU_CACHE_FILE" ] && [ -f "$DU_CACHE_FILE" ]; then
     rm -f -- "$DU_CACHE_FILE"
   fi
 }
-trap cache_cleanup EXIT INT TERM
+# INT and TERM exit rather than just cleaning up: a bare `trap handler INT`
+# returns to whatever it interrupted, and the report would carry on scanning
+# with its index already deleted.
+trap cache_cleanup EXIT
+trap 'cache_cleanup; exit 130' INT
+trap 'cache_cleanup; exit 143' TERM
 
-cache_build() {
-  DU_CACHE_FILE=$(mktemp -t storage-report) || { DU_CACHE_FILE=""; return 0; }
-  {
-    du -kd "$CACHE_DEPTH" "$HOME" 2>/dev/null || true
-    du -kd 1 /Applications 2>/dev/null || true
-  } >"$DU_CACHE_FILE"
+# Opens the index. Returns non-zero if there's nowhere to write it, in which
+# case there's no scan and every lookup falls back to measuring directly.
+cache_build_start() {
+  DU_CACHE_FILE=$(mktemp -t storage-report) || { DU_CACHE_FILE=""; return 1; }
+  SCAN_START=$SECONDS
+  is_tty || echo -e "  ${DIM}Scanning disk (one pass, this takes a moment)...${RESET}"
+}
+
+# Walk one root ($1) to a given depth ($2) into the index, showing progress.
+#
+# The `du` is backgrounded on its own rather than inside a `{ ...; } &` group
+# covering both roots, because `&` on a group forks a subshell: SCAN_PID would
+# be that subshell, and killing it on Ctrl-C would leave its `du` child
+# orphaned and still churning the disk. Backgrounded like this, SCAN_PID *is*
+# the du. Both walks append, and lookups match on path rather than position, so
+# the order they land in doesn't matter.
+scan_step() {
+  du -kd "$2" "$1" >>"$DU_CACHE_FILE" 2>/dev/null &
+  SCAN_PID=$!
+  if is_tty; then
+    scan_progress "$SCAN_PID"
+  else
+    wait "$SCAN_PID" 2>/dev/null || true
+  fi
+  SCAN_PID=""
+}
+
+# Replace the spinner with what the scan came back with.
+scan_finish() {
+  is_tty || return 0
+  local count=0
+  if [ -s "$DU_CACHE_FILE" ]; then
+    count=$(wc -l <"$DU_CACHE_FILE" 2>/dev/null | tr -d ' ') || count=0
+  fi
+  printf '\r\033[K  %b✓%b %bIndexed %s folders in %ss%b\n' \
+    "$GREEN" "$RESET" "$DIM" "$count" "$((SECONDS - SCAN_START))" "$RESET"
+  show_cursor
 }
 
 # If the index is missing or empty (mktemp failed, du produced nothing), every
@@ -262,8 +397,13 @@ echo -e "${RESET}  ${disk_pct}"
 # announce it — it's the part that takes a while, and it runs before the next
 # section can print anything.
 echo ""
-echo -e "  ${DIM}Scanning disk (one pass, this takes a moment)...${RESET}"
-cache_build
+if cache_build_start; then
+  scan_step "$HOME" "$CACHE_DEPTH"
+  scan_step /Applications 1
+  scan_finish
+else
+  echo -e "  ${DIM}Could not create a scan index — measuring each section directly.${RESET}"
+fi
 
 # ── 2. Home Directory Breakdown ──────────────────────────────────────
 header "📁 HOME DIRECTORY BREAKDOWN  (~)"
