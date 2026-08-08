@@ -140,6 +140,23 @@ add_item "$HOME/Library/Caches/Homebrew" "Homebrew download cache" "SAFE"
 Use `SAFE`, `CAUTION`, or `YOUR_CALL`. Non-existent paths are skipped, so it's
 fine to add entries for apps you don't have.
 
+## Alternatives
+
+If you want cleanup rather than a report, use [Mole](https://github.com/tw93/Mole)
+— `brew install mole`. It does considerably more than this script: an interactive
+disk explorer, app uninstaller, orphaned-data detection, build-artifact purge,
+live system monitor. For most people it's the better answer — start there.
+
+This script covers a narrower case:
+
+- **Nothing to install.** bash 3.2 and tools that ship with macOS. Runs over SSH,
+  on a locked-down work Mac, anywhere you can't add a binary.
+- **It cannot delete.** There is no `rm` in it — a property you can confirm in one
+  read, rather than a promise you have to take on trust.
+- **It shows its reasoning.** Each candidate is tagged with what removing it
+  actually costs you, and the decision stays yours.
+
+
 ## Contributing
 
 PRs welcome — especially cleanup paths for apps not yet covered. Two rules:
