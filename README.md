@@ -1,5 +1,15 @@
 # Mac Storage Report
 
+> [!IMPORTANT]
+> **This project is archived. Use [Mole](https://github.com/tw93/Mole) instead.**
+> Mole covers the same ground and much more, and a large community actively
+> maintains it. `mo analyze` breaks down your disk usage, and
+> `mo clean --dry-run` previews what can be cleaned without deleting anything.
+>
+> The script below still works and stays here as-is, but it won't get updates.
+> It's still an option if you want something that only measures and never
+> deletes.
+
 Find out where your Mac's disk space actually went — and what's safe to delete.
 
 [![shellcheck](https://github.com/rxxxxxxb/mac-storage-report/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/rxxxxxxb/mac-storage-report/actions/workflows/shellcheck.yml)
